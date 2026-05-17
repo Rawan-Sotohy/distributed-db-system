@@ -9,7 +9,6 @@ import (
 	"sync"
 )
 
-// Slave registry
 var (
 	slaves   []string
 	slavesMu sync.RWMutex
@@ -24,57 +23,37 @@ type ReplicationPayload struct {
 	Columns []string    `json:"columns,omitempty"`
 }
 
-// ReplicationResult holds the result of replicating to one slave
 type ReplicationResult struct {
 	Slave   string
 	Success bool
 	Message string
 }
 
-// sendToSlave sends a replication payload to one slave and returns the result via channel
 func sendToSlave(addr string, body []byte, resultCh chan<- ReplicationResult) {
 	resp, err := http.Post("http://"+addr+"/replicate", "application/json", bytes.NewReader(body))
 	if err != nil {
-		// Slave is down — send failure result through channel
-		resultCh <- ReplicationResult{
-			Slave:   addr,
-			Success: false,
-			Message: fmt.Sprintf("unreachable: %v", err),
-		}
+		resultCh <- ReplicationResult{Slave: addr, Success: false, Message: fmt.Sprintf("unreachable: %v", err)}
 		return
 	}
 	defer resp.Body.Close()
-
-	// Slave responded — send success result through channel
-	resultCh <- ReplicationResult{
-		Slave:   addr,
-		Success: true,
-		Message: fmt.Sprintf("status %d", resp.StatusCode),
-	}
+	resultCh <- ReplicationResult{Slave: addr, Success: true, Message: fmt.Sprintf("status %d", resp.StatusCode)}
 }
 
-// broadcast sends the payload to all slaves using goroutines + channels
 func broadcast(payload ReplicationPayload) {
 	slavesMu.RLock()
 	slavesCopy := make([]string, len(slaves))
 	copy(slavesCopy, slaves)
 	slavesMu.RUnlock()
 
-	if len(slavesCopy) == 0 {
-		return
-	}
+	if len(slavesCopy) == 0 { return }
 
 	body, _ := json.Marshal(payload)
-
-	// Channel to collect results from all goroutines
 	resultCh := make(chan ReplicationResult, len(slavesCopy))
 
-	// Launch one goroutine per slave
 	for _, addr := range slavesCopy {
 		go sendToSlave(addr, body, resultCh)
 	}
 
-	// Collect all results from the channel
 	for i := 0; i < len(slavesCopy); i++ {
 		result := <-resultCh
 		if result.Success {
@@ -85,7 +64,6 @@ func broadcast(payload ReplicationPayload) {
 	}
 }
 
-// syncSlave sends a full snapshot to a newly registered slave
 func syncSlave(addr string) error {
 	snapshot := getFullSnapshot()
 	body, _ := json.Marshal(snapshot)

@@ -1,164 +1,190 @@
 package main
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type Record map[string]string
 
-type Table struct {
-	Columns []string          `json:"columns"`
-	Rows    map[string]Record `json:"rows"`
-	NextID  int               `json:"next_id"`
-}
-
-type Database struct {
-	Name   string            `json:"name"`
-	Tables map[string]*Table `json:"tables"`
-}
-
 var (
-	databases = map[string]*Database{}
-	dbMu      sync.RWMutex
+	db   *sql.DB
+	dbMu sync.RWMutex
 )
 
-func applyCreateDB(name string) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	if _, exists := databases[name]; !exists {
-		databases[name] = &Database{Name: name, Tables: map[string]*Table{}}
-		saveDB(name)
+func connectMySQL() error {
+	var err error
+	db, err = sql.Open("mysql", "root:root123@tcp(127.0.0.1:3306)/")
+	if err != nil {
+		return fmt.Errorf("failed to open MySQL: %v", err)
 	}
+	if err = db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping MySQL: %v", err)
+	}
+	return nil
+}
+
+// ---------- Apply Replication ----------
+
+func applyCreateDB(name string) {
+	db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", name))
 }
 
 func applyDropDB(name string) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	delete(databases, name)
-	os.Remove("data_" + name + ".json")
+	db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", name))
 }
 
 func applyCreateTable(dbName, tableName string, columns []string) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	db, exists := databases[dbName]
-	if !exists { return }
-	if _, exists := db.Tables[tableName]; !exists {
-		db.Tables[tableName] = &Table{Columns: columns, Rows: map[string]Record{}, NextID: 1}
-		saveDB(dbName)
+	cols := "id INT AUTO_INCREMENT PRIMARY KEY"
+	for _, c := range columns {
+		cols += fmt.Sprintf(", `%s` VARCHAR(255)", c)
 	}
+	db.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s` (%s)", dbName, tableName, cols))
 }
 
 func applyDeleteTable(dbName, tableName string) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	db, exists := databases[dbName]
-	if !exists { return }
-	delete(db.Tables, tableName)
-	saveDB(dbName)
+	db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", dbName, tableName))
 }
 
 func applyInsert(dbName, tableName, id string, record Record) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	db, exists := databases[dbName]
-	if !exists { return }
-	table, exists := db.Tables[tableName]
-	if !exists { return }
-	table.Rows[id] = record
-	saveDB(dbName)
+	cols := []string{}
+	vals := []interface{}{id}
+	placeholders := []string{"?"}
+	for k, v := range record {
+		cols = append(cols, fmt.Sprintf("`%s`", k))
+		vals = append(vals, v)
+		placeholders = append(placeholders, "?")
+	}
+	db.Exec(fmt.Sprintf(
+		"INSERT INTO `%s`.`%s` (id, %s) VALUES (%s)",
+		dbName, tableName,
+		strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "),
+	), vals...)
 }
 
 func applyUpdate(dbName, tableName, id string, updates Record) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	db, exists := databases[dbName]
-	if !exists { return }
-	table, exists := db.Tables[tableName]
-	if !exists { return }
-	row, exists := table.Rows[id]
-	if !exists { return }
+	sets := []string{}
+	vals := []interface{}{}
 	for k, v := range updates {
-		row[k] = v
+		sets = append(sets, fmt.Sprintf("`%s` = ?", k))
+		vals = append(vals, v)
 	}
-	saveDB(dbName)
+	vals = append(vals, id)
+	db.Exec(fmt.Sprintf(
+		"UPDATE `%s`.`%s` SET %s WHERE id = ?",
+		dbName, tableName, strings.Join(sets, ", "),
+	), vals...)
 }
 
 func applyDelete(dbName, tableName, id string) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	db, exists := databases[dbName]
-	if !exists { return }
-	table, exists := db.Tables[tableName]
-	if !exists { return }
-	delete(table.Rows, id)
-	saveDB(dbName)
+	db.Exec(fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE id = ?", dbName, tableName), id)
 }
+
+func applyFullSync(snapshot map[string]interface{}) {
+	for dbName, dbData := range snapshot {
+		applyCreateDB(dbName)
+		tables, ok := dbData.(map[string]interface{})
+		if !ok { continue }
+		for tableName, tableData := range tables {
+			td, ok := tableData.(map[string]interface{})
+			if !ok { continue }
+			colsRaw, _ := td["columns"].([]interface{})
+			cols := []string{}
+			for _, c := range colsRaw { cols = append(cols, fmt.Sprintf("%v", c)) }
+			applyCreateTable(dbName, tableName, cols)
+			rowsRaw, _ := td["rows"].([]interface{})
+			for _, rowRaw := range rowsRaw {
+				row, ok := rowRaw.(map[string]interface{})
+				if !ok { continue }
+				id := fmt.Sprintf("%v", row["id"])
+				record := Record{}
+				for k, v := range row {
+					if k != "id" { record[k] = fmt.Sprintf("%v", v) }
+				}
+				applyInsert(dbName, tableName, id, record)
+			}
+		}
+	}
+}
+
+// ---------- Read Operations ----------
 
 func selectRecords(dbName, tableName string) ([]map[string]string, error) {
 	dbMu.RLock()
 	defer dbMu.RUnlock()
-	db, exists := databases[dbName]
-	if !exists { return nil, fmt.Errorf("database not found") }
-	table, exists := db.Tables[tableName]
-	if !exists { return nil, fmt.Errorf("table not found") }
-	var results []map[string]string
-	for id, row := range table.Rows {
-		r := map[string]string{"id": id}
-		for k, v := range row { r[k] = v }
-		results = append(results, r)
-	}
-	return results, nil
+	return queryRows(fmt.Sprintf("SELECT * FROM `%s`.`%s`", dbName, tableName))
 }
 
 func searchRecords(dbName, tableName, field, value string) ([]map[string]string, error) {
 	dbMu.RLock()
 	defer dbMu.RUnlock()
-	db, exists := databases[dbName]
-	if !exists { return nil, fmt.Errorf("database not found") }
-	table, exists := db.Tables[tableName]
-	if !exists { return nil, fmt.Errorf("table not found") }
+	return queryRows(
+		fmt.Sprintf("SELECT * FROM `%s`.`%s` WHERE `%s` LIKE ?", dbName, tableName, field),
+		"%"+value+"%",
+	)
+}
+
+func listDBs() ([]string, error) {
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil { return nil, err }
+	defer rows.Close()
+	system := map[string]bool{"information_schema": true, "mysql": true, "performance_schema": true, "sys": true}
+	var dbs []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		if !system[name] { dbs = append(dbs, name) }
+	}
+	return dbs, nil
+}
+
+func listTables(dbName string) ([]string, error) {
+	rows, err := db.Query(fmt.Sprintf("SHOW TABLES IN `%s`", dbName))
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var tables []string
+	for rows.Next() {
+		var t string
+		rows.Scan(&t)
+		tables = append(tables, t)
+	}
+	return tables, nil
+}
+
+func getColumns(dbName, tableName string) ([]string, error) {
+	rows, err := db.Query(fmt.Sprintf("SHOW COLUMNS FROM `%s`.`%s`", dbName, tableName))
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var field, typ, null, key, def, extra sql.NullString
+		rows.Scan(&field, &typ, &null, &key, &def, &extra)
+		if field.String != "id" { cols = append(cols, field.String) }
+	}
+	return cols, nil
+}
+
+func queryRows(query string, args ...interface{}) ([]map[string]string, error) {
+	rows, err := db.Query(query, args...)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	cols, _ := rows.Columns()
 	var results []map[string]string
-	for id, row := range table.Rows {
-		if v, ok := row[field]; ok && strings.Contains(strings.ToLower(v), strings.ToLower(value)) {
-			r := map[string]string{"id": id}
-			for k, val := range row { r[k] = val }
-			results = append(results, r)
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals { ptrs[i] = &vals[i] }
+		rows.Scan(ptrs...)
+		row := map[string]string{}
+		for i, col := range cols {
+			if vals[i] != nil { row[col] = fmt.Sprintf("%s", vals[i]) } else { row[col] = "" }
 		}
+		results = append(results, row)
 	}
 	return results, nil
-}
-
-func applyFullSync(snapshot map[string]*Database) {
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	databases = snapshot
-	for name := range databases {
-		saveDB(name)
-	}
-}
-
-func saveDB(name string) {
-	db, exists := databases[name]
-	if !exists { return }
-	data, _ := json.MarshalIndent(db, "", "  ")
-	os.WriteFile("data_"+name+".json", data, 0644)
-}
-
-func loadAllDBs() {
-	files, _ := os.ReadDir(".")
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "data_") && strings.HasSuffix(f.Name(), ".json") {
-			data, err := os.ReadFile(f.Name())
-			if err != nil { continue }
-			var db Database
-			if err := json.Unmarshal(data, &db); err == nil {
-				databases[db.Name] = &db
-			}
-		}
-	}
 }

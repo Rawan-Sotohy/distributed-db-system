@@ -70,3 +70,7 @@ button.primary:hover { background: #1e40af; }
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat-val { font-size: 22px; font-weight: 700; color: #58a6ff; }
 .stat-label { color: #8b949e; font-size: 11px; }
+
+.node-master { border: 1px solid #f59e0b; }
+#master-bar { display: flex !important; }
+#sql-prompt:focus { outline: none; border-color: #58a6ff; }

@@ -1,142 +1,121 @@
-import json
-import os
+import mysql.connector
 import threading
-from copy import deepcopy
 
-databases = {}
-db_lock = threading.RLock()
+_local = threading.local()
+MASTER_ADDR = "localhost:8080"
 
-def save_db(name):
-    db = databases.get(name)
-    if db is None:
-        return
-    with open(f"data_{name}.json", "w") as f:
-        json.dump(db, f, indent=2)
+def get_conn():
+    if not hasattr(_local, 'conn') or not _local.conn.is_connected():
+        _local.conn = mysql.connector.connect(
+            host="127.0.0.1",
+            user="root",
+            password="root123"
+        )
+    return _local.conn
 
-def load_all_dbs():
-    for fname in os.listdir("."):
-        if fname.startswith("data_") and fname.endswith(".json"):
-            with open(fname) as f:
-                try:
-                    db = json.load(f)
-                    databases[db["name"]] = db
-                except:
-                    pass
+def execute(query, params=None, fetch=False):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(query, params or [])
+    if fetch:
+        cols = [d[0] for d in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        return cols, rows
+    conn.commit()
+    lastid = cursor.lastrowid
+    cursor.close()
+    return lastid
+
+SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys"}
+
+# ---------- Apply Replication ----------
 
 def apply_create_db(name):
-    with db_lock:
-        if name not in databases:
-            databases[name] = {"name": name, "tables": {}}
-            save_db(name)
+    execute(f"CREATE DATABASE IF NOT EXISTS `{name}`")
 
 def apply_drop_db(name):
-    with db_lock:
-        databases.pop(name, None)
-        try: os.remove(f"data_{name}.json")
-        except: pass
+    execute(f"DROP DATABASE IF EXISTS `{name}`")
 
 def apply_create_table(db_name, table_name, columns):
-    with db_lock:
-        db = databases.get(db_name)
-        if db and table_name not in db["tables"]:
-            db["tables"][table_name] = {"columns": columns, "rows": {}, "next_id": 1}
-            save_db(db_name)
+    cols = "id INT AUTO_INCREMENT PRIMARY KEY"
+    for c in columns:
+        cols += f", `{c}` VARCHAR(255)"
+    execute(f"CREATE TABLE IF NOT EXISTS `{db_name}`.`{table_name}` ({cols})")
 
 def apply_delete_table(db_name, table_name):
-    with db_lock:
-        db = databases.get(db_name)
-        if db:
-            db["tables"].pop(table_name, None)
-            save_db(db_name)
+    execute(f"DROP TABLE IF EXISTS `{db_name}`.`{table_name}`")
 
 def apply_insert(db_name, table_name, record_id, record):
-    with db_lock:
-        db = databases.get(db_name)
-        if db:
-            table = db["tables"].get(table_name)
-            if table:
-                table["rows"][record_id] = record
-                save_db(db_name)
+    cols = ", ".join(f"`{k}`" for k in record)
+    placeholders = ", ".join(["%s"] * len(record))
+    vals = list(record.values())
+    execute(
+        f"INSERT INTO `{db_name}`.`{table_name}` (id, {cols}) VALUES (%s, {placeholders})",
+        [record_id] + vals
+    )
 
 def apply_update(db_name, table_name, record_id, updates):
-    with db_lock:
-        db = databases.get(db_name)
-        if db:
-            table = db["tables"].get(table_name)
-            if table and record_id in table["rows"]:
-                table["rows"][record_id].update(updates)
-                save_db(db_name)
+    sets = ", ".join(f"`{k}` = %s" for k in updates)
+    vals = list(updates.values()) + [record_id]
+    execute(f"UPDATE `{db_name}`.`{table_name}` SET {sets} WHERE id = %s", vals)
 
 def apply_delete(db_name, table_name, record_id):
-    with db_lock:
-        db = databases.get(db_name)
-        if db:
-            table = db["tables"].get(table_name)
-            if table:
-                table["rows"].pop(record_id, None)
-                save_db(db_name)
+    execute(f"DELETE FROM `{db_name}`.`{table_name}` WHERE id = %s", [record_id])
 
 def apply_full_sync(snapshot):
-    with db_lock:
-        databases.clear()
-        databases.update(snapshot)
-        for name in databases:
-            save_db(name)
+    for db_name, tables in snapshot.items():
+        apply_create_db(db_name)
+        for table_name, table_data in tables.items():
+            cols = table_data.get("columns", [])
+            apply_create_table(db_name, table_name, cols)
+            for row in table_data.get("rows", []):
+                rid = row.get("id")
+                record = {k: v for k, v in row.items() if k != "id"}
+                apply_insert(db_name, table_name, rid, record)
+
+# ---------- Read Operations ----------
 
 def select_records(db_name, table_name):
-    with db_lock:
-        db = databases.get(db_name)
-        if not db:
-            return None, "database not found"
-        table = db["tables"].get(table_name)
-        if not table:
-            return None, "table not found"
-        results = []
-        for rid, row in table["rows"].items():
-            r = {"id": rid, **row}
-            results.append(r)
-        return results, None
+    try:
+        col_names, rows = execute(f"SELECT * FROM `{db_name}`.`{table_name}`", fetch=True)
+        return [dict(zip(col_names, [str(v) if v is not None else "" for v in row])) for row in rows], None
+    except Exception as e:
+        return None, str(e)
 
 def search_records(db_name, table_name, field, value):
-    with db_lock:
-        db = databases.get(db_name)
-        if not db:
-            return None, "database not found"
-        table = db["tables"].get(table_name)
-        if not table:
-            return None, "table not found"
-        results = []
-        for rid, row in table["rows"].items():
-            if field in row and value.lower() in row[field].lower():
-                results.append({"id": rid, **row})
-        return results, None
+    try:
+        col_names, rows = execute(
+            f"SELECT * FROM `{db_name}`.`{table_name}` WHERE `{field}` LIKE %s",
+            [f"%{value}%"], fetch=True
+        )
+        return [dict(zip(col_names, [str(v) if v is not None else "" for v in row])) for row in rows], None
+    except Exception as e:
+        return None, str(e)
 
-def get_databases():
-    with db_lock:
-        return list(databases.keys())
+def list_dbs():
+    _, rows = execute("SHOW DATABASES", fetch=True)
+    return [r[0] for r in rows if r[0] not in SYSTEM_DBS]
 
-def get_tables(db_name):
-    with db_lock:
-        db = databases.get(db_name)
-        if not db:
-            return None
-        return list(db["tables"].keys())
+def list_tables(db_name):
+    try:
+        _, rows = execute(f"SHOW TABLES IN `{db_name}`", fetch=True)
+        return [r[0] for r in rows], None
+    except Exception as e:
+        return None, str(e)
 
-# Special feature: return stats about a table (Python's unique contribution)
+def get_columns(db_name, table_name):
+    try:
+        _, rows = execute(f"SHOW COLUMNS FROM `{db_name}`.`{table_name}`", fetch=True)
+        return [r[0] for r in rows if r[0] != "id"], None
+    except Exception as e:
+        return None, str(e)
+
 def get_table_stats(db_name, table_name):
-    with db_lock:
-        db = databases.get(db_name)
-        if not db:
-            return None, "database not found"
-        table = db["tables"].get(table_name)
-        if not table:
-            return None, "table not found"
-        row_count = len(table["rows"])
-        col_count = len(table["columns"])
-        return {
-            "db": db_name,
-            "table": table_name,
-            "row_count": row_count,
-            "column_count": col_count,
-            "columns": table["columns"],
-        }, None
+    try:
+        cols, _ = get_columns(db_name, table_name)
+        _, rows = execute(f"SELECT COUNT(*) FROM `{db_name}`.`{table_name}`", fetch=True)
+        count = rows[0][0]
+        return {"db": db_name, "table": table_name, "row_count": count, "column_count": len(cols), "columns": cols}, None
+    except Exception as e:
+        return None, str(e)

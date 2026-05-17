@@ -23,22 +23,35 @@
 
   <div class="main">
     <div class="topbar">
-      <span id="current-context">Select a database</span>
-      <div class="topbar-actions">
-        <button class="danger" onclick="openModal('drop-db')" id="btn-drop-db" style="display:none">Drop DB</button>
-        <button onclick="openModal('create-table')" id="btn-create-table" style="display:none">+ New Table</button>
-      </div>
+  <span id="current-context">Select a database</span>
+  <div class="topbar-actions">
+    <button id="btn-pulse" onclick="viewPulseLog()" style="display:none">📋 Pulse Log</button>
+    <button id="btn-pending" onclick="showPending()" style="display:none">
+      📬 Pending <span id="pending-badge" style="background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px">0</span>
+    </button>
+    <button onclick="openUpload()">📤 Upload DB</button>
+    <button class="danger" onclick="openModal('drop-db')" id="btn-drop-db" style="display:none">Drop DB</button>
+    <button onclick="openModal('create-table')" id="btn-create-table" style="display:none">+ New Table</button>
+  </div>
+</div>
+
+    <!-- Master only bar: Text to SQL + Sharding -->
+    <div id="master-bar" style="display:none;padding:10px 20px;border-bottom:1px solid #30363d;background:#0d1117;display:flex;gap:8px;align-items:center">
+      <input id="sql-prompt" placeholder="💬 Type in plain text e.g. 'show all students' or 'insert name Ali age 20'" 
+        style="flex:1;padding:8px 12px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#e0e0e0;font-size:13px"
+        onkeydown="if(event.key==='Enter')runPrompt()" />
+      <button class="primary" onclick="runPrompt()">▶ Run</button>
+      <button onclick="openSharding()" title="Sharding">🔀 Shard</button>
     </div>
 
     <div id="tables-bar" class="tables-bar"></div>
 
     <div class="toolbar" id="toolbar" style="display:none">
-      <button onclick="openModal('insert')">+ Insert</button>
-      <button onclick="openModal('search')">🔍 Search</button>
-      <button onclick="loadRecords()">↻ Refresh</button>
-      <button class="danger" onclick="openModal('delete-table')">Delete Table</button>
-      <span id="special-btn"></span>
-    </div>
+  <button onclick="openModal('insert')">+ Insert</button>
+  <button onclick="openModal('search')">🔍 Search</button>
+  <button onclick="loadRecords()">↻ Refresh</button>
+  <button class="danger" onclick="openModal('delete-table')">Delete Table</button>
+     </div>
 
     <div id="results"></div>
   </div>
@@ -51,7 +64,6 @@
   </div>
 
   <div id="toast"></div>
-
   <script src="app.js"></script>
 </body>
 </html>
